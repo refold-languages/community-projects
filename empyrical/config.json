@@ -1,0 +1,6 @@
+{
+    "hill1t": {
+        "text_path": "./resources/OANC-GrAF/data/written_1/journal/slate/1",
+        "spacy_pipeline": "en_core_web_sm"
+    }
+}
