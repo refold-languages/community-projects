@@ -7,7 +7,7 @@ The current scripts are:
 
 - **Hill1t**: At each stage of the immersion learning process, how much does one know, and how much is there to learn? Hill1t ("Hill it") measures this. Using a large amount of text, it will compute at each step of the process of sentence mining through the text. That is, how much a reader would understand ("Comprehensibility") and how much there is to learn ("1T Frequency"). The result is a rough estimate of how much learning opportunity there is at each step of learning a text. Below is an image of what this information looks like for a collection of 40 news articles.
 
-![[images/hill1t-news40.png]]
+![Hill1t Results for 40 News Articles](images/hill1t-news40.png)
 
 ## Installation
 
