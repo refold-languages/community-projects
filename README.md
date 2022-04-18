@@ -1,1 +1,1 @@
-# community_projects
+# community-projects
