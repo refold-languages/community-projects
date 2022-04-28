@@ -4,21 +4,28 @@ import re
 from collections import Counter
 from math import ceil
 
+import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 import spacy
 from tqdm import tqdm
 
 
-def get_config():
+def get_args():
     """
-    Fetch the config data for the script, look in `config.json` under `hill1t`
+    Fetch the arguments from the command line arguments.
 
     Returns:
-        dict: The config as a dictionary, see `config.json`
+        dict: The key-value pairs of the parameters and values.
     """
-    with open('config.json', 'r') as f:
-        return json.loads(f.read())["hill1t"]
+    parser = argparse.ArgumentParser(description="Generate the 1T Sentence Hill for Given Text")
+    parser.add_argument('text_path', metavar='P', type=str, nargs='?', default='./resources', help='The directory to search for text')
+    parser.add_argument('spacy_pipeline', metavar='S', type=str, nargs='?', default='en_core_web_sm', help='The spacy language pipeline to use, see https://spacy.io/models/')
+    parsed = parser.parse_args()
+    return {
+        "text_path": parsed.text_path,
+        "spacy_pipeline": parsed.spacy_pipeline
+    }
 
 
 def find_text_files(directory):
@@ -55,7 +62,7 @@ def compile_texts(files):
     """
     texts = []
     for path in tqdm(files, desc="Reading Raw Text"):
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="latin-1") as f:
             texts.append(f.read())
     # Tone down whitespace if text is heavily indented
     return [re.sub(r"\s+", " ", text.strip()) for text in texts]
@@ -193,13 +200,13 @@ def plot_1ts(count1ts, freq_list):
 
 
 if __name__ == "__main__":
-    CONFIG = get_config()
+    ARGS = get_args()
     # Get raw text
-    files = find_text_files(CONFIG["text_path"])
+    files = find_text_files(ARGS["text_path"])
     texts = compile_texts(files)
     # Boring preprocessing
     processed = language_preprocessing(
-        spacy.load(CONFIG["spacy_pipeline"]), texts)
+        spacy.load(ARGS["spacy_pipeline"]), texts)
     # Fun postprocessing
     freq_list = get_freq_list(processed)
     counts = count_1ts(freq_list, processed)
