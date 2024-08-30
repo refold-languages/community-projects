@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chorusing App</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/wavesurfer.js/6.6.3/wavesurfer.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/wavesurfer.js/6.6.3/plugin/wavesurfer.regions.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        #waveform { margin-top: 20px; }
+        #file-upload, #quick-start { margin-bottom: 20px; }
+        .controls { margin-top: 20px; display: flex; align-items: center; gap: 10px; }
+        input[type="range"] { width: 100px; }
+        #loop-delay, .saved-loop-delay { width: 50px; }
+        #saved-loops { margin-top: 40px; }
+        .saved-loop { border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; }
+        .saved-loop-waveform { height: 50px; }
+        #direct-monitor-controls { margin-bottom: 20px; }
+    </style>
+    <script>
+        // This script will be used to create our AudioWorkletProcessor
+        const audioWorkletCode = `
+          class LowLatencyProcessor extends AudioWorkletProcessor {
+            process(inputs, outputs) {
+              const input = inputs[0];
+              const output = outputs[0];
+              for (let channel = 0; channel < output.length; ++channel) {
+                output[channel].set(input[channel]);
+              }
+              return true;
+            }
+          }
+          registerProcessor('low-latency-processor', LowLatencyProcessor);
+        `;
+    
+        const blob = new Blob([audioWorkletCode], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(blob);
+    </script>
+</head>
+<body>
+    <h1>Chorusing App</h1>
+
+    <!-- New Direct Monitoring Controls -->
+    <div id="direct-monitor-controls">
+        <button id="directMonitorToggle">Direct Monitor Off</button>
+        <select id="microphoneSelect">
+            <option value="">Select Microphone</option>
+        </select>
+        <label for="directMonitorVolume">Volume:</label>
+        <input type="range" id="directMonitorVolume" min="0" max="1" step="0.01" value="1">
+    </div>
+
+    <select id="quick-start">
+        <option value="">Select a previously uploaded file</option>
+    </select>
+    <input type="file" id="file-upload" accept="audio/*">
+    <div id="waveform"></div>
+    <div class="controls">
+        <button id="playPause">Play/Pause</button>
+        <button id="removeSelection">Remove Selection</button>
+        <button id="saveLoop" style="display:none;">Save Loop</button>
+        <input type="range" id="volume" min="0" max="1" step="0.1" value="1">
+        <label for="volume">Volume</label>
+        <input type="range" id="zoom" min="10" max="1000" step="10" value="10">
+        <label for="zoom">Zoom</label>
+        <button id="loop">Loop Off</button>
+        <input type="number" id="loop-delay" value="0" min="0" step="0.1">
+        <label for="loop-delay">Loop Delay (s)</label>
+    </div>
+    <div id="saved-loops"></div>
+
+    <script>
+        let wavesurfer;
+        let currentZoomLevel = 10;
+        let activeRegion = null;
+        let isLooping = false;
+        let loopTimeoutId = null;
+        let savedLoops = [];
+        let isDirectMonitorOn = false;
+        let audioContext;
+        let microphoneStream;
+        let sourceNode;
+        let gainNode;
+
+        // Initialize Direct Monitoring controls
+        const directMonitorToggle = document.getElementById('directMonitorToggle');
+        const microphoneSelect = document.getElementById('microphoneSelect');
+        const directMonitorVolume = document.getElementById('directMonitorVolume');
+
+        // Populate microphone select
+        async function populateMicrophoneSelect() {
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const microphones = devices.filter(device => device.kind === 'audioinput');
+                microphoneSelect.innerHTML = '<option value="">Select Microphone</option>';
+                microphones.forEach(mic => {
+                    const option = document.createElement('option');
+                    option.value = mic.deviceId;
+                    option.text = mic.label || `Microphone ${mic.deviceId.slice(0, 5)}`;
+                    microphoneSelect.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Error enumerating devices:', error);
+            }
+        }
+
+        populateMicrophoneSelect();
+
+        // Direct Monitor toggle
+        directMonitorToggle.addEventListener('click', () => {
+            isDirectMonitorOn = !isDirectMonitorOn;
+            directMonitorToggle.textContent = isDirectMonitorOn ? 'Direct Monitor On' : 'Direct Monitor Off';
+            if (isDirectMonitorOn) {
+                startDirectMonitoring();
+            } else {
+                stopDirectMonitoring();
+            }
+        });
+
+        // Microphone select change
+        microphoneSelect.addEventListener('change', () => {
+            if (isDirectMonitorOn) {
+                stopDirectMonitoring();
+                startDirectMonitoring();
+            }
+        });
+
+        // Direct Monitor volume change
+        directMonitorVolume.addEventListener('input', (e) => {
+            if (gainNode) {
+                gainNode.gain.setValueAtTime(parseFloat(e.target.value), audioContext.currentTime);
+            }
+        });
+
+        // Start Direct Monitoring
+        async function startDirectMonitoring() {
+            try {
+                const constraints = {
+                    audio: {
+                        deviceId: microphoneSelect.value ? { exact: microphoneSelect.value } : undefined,
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false
+                    }
+                };
+                
+                microphoneStream = await navigator.mediaDevices.getUserMedia(constraints);
+                
+                // Use the existing audio context if available, or create a new one
+                audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)({
+                    latencyHint: 'interactive',
+                    sampleRate: 48000
+                });
+
+                // Add the worklet module
+                await audioContext.audioWorklet.addModule(workletUrl);
+                
+                // Create the worklet node
+                workletNode = new AudioWorkletNode(audioContext, 'low-latency-processor');
+                
+                const sourceNode = audioContext.createMediaStreamSource(microphoneStream);
+                gainNode = audioContext.createGain();
+                gainNode.gain.setValueAtTime(parseFloat(directMonitorVolume.value), audioContext.currentTime);
+
+                sourceNode.connect(workletNode);
+                workletNode.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+
+                // Resume audio context if it's suspended
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+            } catch (error) {
+                console.error('Error starting direct monitoring:', error);
+                isDirectMonitorOn = false;
+                directMonitorToggle.textContent = 'Direct Monitor Off';
+            }
+        }
+
+        // Stop Direct Monitoring
+        function stopDirectMonitoring() {
+            if (workletNode) workletNode.disconnect();
+            if (gainNode) gainNode.disconnect();
+            if (microphoneStream) {
+                microphoneStream.getTracks().forEach(track => track.stop());
+            }
+            // Don't close the audio context, just disconnect the nodes
+            workletNode = null;
+            gainNode = null;
+            microphoneStream = null;
+        }
+
+        // Debounce function (unchanged)
+        function debounce(func, wait) {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    clearTimeout(timeout);
+                    func(...args);
+                };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        }
+
+        // Load the list of previously uploaded files (unchanged)
+        fetch('/list_files')
+            .then(response => response.json())
+            .then(files => {
+                const quickStart = document.getElementById('quick-start');
+                files.forEach(file => {
+                    const option = document.createElement('option');
+                    option.value = file;
+                    option.textContent = file;
+                    quickStart.appendChild(option);
+                });
+            });
+
+        // Quick Start selector (unchanged)
+        document.getElementById('quick-start').addEventListener('change', function(e) {
+            if (e.target.value) {
+                loadAudio(e.target.value);
+            }
+        });
+
+        // File upload handler (unchanged)
+        document.getElementById('file-upload').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.text())
+            .then(filename => {
+                loadAudio(filename);
+                const quickStart = document.getElementById('quick-start');
+                const option = document.createElement('option');
+                option.value = filename;
+                option.textContent = filename;
+                quickStart.appendChild(option);
+                quickStart.value = filename;
+            })
+            .catch(error => console.error('Error:', error));
+        });
+
+function loadAudio(filename) {
+    if (wavesurfer) {
+        wavesurfer.destroy();
+    }
+    wavesurfer = WaveSurfer.create({
+        container: '#waveform',
+        waveColor: 'violet',
+        progressColor: 'purple',
+        responsive: true,
+        barWidth: 3,
+        barRadius: 3,
+        cursorWidth: 1,
+        height: 200,
+        barGap: 3,
+        plugins: [
+            WaveSurfer.regions.create()
+        ]
+    });
+    wavesurfer.load(`/uploads/${filename}`);
+
+    wavesurfer.on('ready', function() {
+        currentZoomLevel = 10;
+        document.getElementById('zoom').value = currentZoomLevel;
+        applyZoom(currentZoomLevel);
+        enableControls();
+        loadSavedLoops(filename);  // Load saved loops for this audio file
+    });
+
+    wavesurfer.on('region-update-end', function(region) {
+        activeRegion = region;
+        document.getElementById('saveLoop').style.display = 'inline-block';
+    });
+
+    wavesurfer.on('region-click', function(region, e) {
+        e.stopPropagation();
+        region.play();
+    });
+
+    wavesurfer.on('audioprocess', function() {
+        if (isLooping && activeRegion) {
+            if (wavesurfer.getCurrentTime() >= activeRegion.end) {
+                wavesurfer.pause();
+                const loopDelay = parseFloat(document.getElementById('loop-delay').value) * 1000;
+                clearTimeout(loopTimeoutId);
+                loopTimeoutId = setTimeout(() => {
+                    wavesurfer.play(activeRegion.start);
+                }, loopDelay);
+            }
+        }
+    });
+}
+
+        function enableControls() {
+            // Prevent default zoom on Ctrl + scroll wheel (unchanged)
+            document.addEventListener('wheel', function(e) {
+                if (e.ctrlKey) {
+                    e.preventDefault();
+                }
+            }, { passive: false });
+
+            // Ctrl + Scroll wheel zoom for waveform (unchanged)
+            document.getElementById('waveform').addEventListener('wheel', debounce(function(e) {
+                if (e.ctrlKey && wavesurfer) {
+                    const delta = e.deltaY > 0 ? -10 : 10;
+                    const newZoom = Math.max(10, Math.min(1000, currentZoomLevel + delta));
+                    document.getElementById('zoom').value = newZoom;
+                    applyZoom(newZoom);
+                }
+            }, 50));
+
+            // Enable region selection
+            wavesurfer.enableDragSelection({});
+        }
+
+        function playPauseHandler() {
+            if (wavesurfer) {
+                if (activeRegion && !wavesurfer.isPlaying()) {
+                    wavesurfer.play(activeRegion.start);
+                } else {
+                    wavesurfer.playPause();
+                }
+            }
+        }
+
+        // Play/Pause button
+        document.getElementById('playPause').addEventListener('click', playPauseHandler);
+
+        // Spacebar play/pause
+        document.addEventListener('keydown', function(e) {
+            if (e.code === 'Space' && wavesurfer) {
+                e.preventDefault();
+                playPauseHandler();
+            }
+        });
+
+        // Remove Selection button
+        document.getElementById('removeSelection').addEventListener('click', function() {
+            if (activeRegion) {
+                activeRegion.remove();
+                activeRegion = null;
+                document.getElementById('saveLoop').style.display = 'none';
+            }
+        });
+
+// Save Loop button
+document.getElementById('saveLoop').addEventListener('click', function() {
+    if (activeRegion) {
+        console.log('Saving loop:', activeRegion);  // Debug line
+        const loopId = Date.now();
+        const currentFileName = document.getElementById('quick-start').value;
+        const currentAudioSrc = `/uploads/${currentFileName}`; // Fix: Use currentFileName instead of filename
+        console.log('Loading saved loop with audio source:', currentAudioSrc);  // Debug line
+        
+        if (!currentFileName) {
+            console.error('No file selected');
+            return;
+        }
+
+        // Create the saved loop element first
+        const savedLoopElement = document.createElement('div');
+        savedLoopElement.className = 'saved-loop';
+        savedLoopElement.innerHTML = `
+            <div id="savedLoop${loopId}" class="saved-loop-waveform"></div>
+            <button class="saved-loop-play">Play</button>
+            <button class="saved-loop-loop">Loop Off</button>
+            <input type="number" class="saved-loop-delay" value="0" min="0" step="0.1">
+            <label>Loop Delay (s)</label>
+        `;
+
+        // Append the saved loop element to the DOM
+        document.getElementById('saved-loops').appendChild(savedLoopElement);
+
+        // Now create the WaveSurfer instance for the saved loop
+        try {
+            const loopWavesurfer = WaveSurfer.create({
+                container: `#savedLoop${loopId}`,
+                waveColor: 'blue',
+                progressColor: 'purple',
+                responsive: true,
+                barWidth: 2,
+                barRadius: 3,
+                cursorWidth: 1,
+                height: 50,
+                barGap: 2,
+                plugins: [
+                    WaveSurfer.regions.create()
+                ]
+            });
+
+            // Load the same audio file
+            loopWavesurfer.load(currentAudioSrc);
+
+            const loopRegion = {
+                start: activeRegion.start,
+                end: activeRegion.end,
+                color: 'rgba(0, 0, 255, 0.1)'
+            };
+
+            loopWavesurfer.on('ready', function() {
+                loopWavesurfer.addRegion(loopRegion);
+                // Zoom the waveform to show only the selected region
+                loopWavesurfer.zoom(loopWavesurfer.drawer.width / (loopRegion.end - loopRegion.start));
+                loopWavesurfer.seekTo(loopRegion.start / loopWavesurfer.getDuration());
+            });
+
+            const playButton = savedLoopElement.querySelector('.saved-loop-play');
+            const loopButton = savedLoopElement.querySelector('.saved-loop-loop');
+            const delayInput = savedLoopElement.querySelector('.saved-loop-delay');
+
+            let isLoopPlaying = false;
+            let loopTimeoutId = null;
+
+            playButton.addEventListener('click', function() {
+                if (isLoopPlaying) {
+                    loopWavesurfer.pause();
+                    isLoopPlaying = false;
+                    playButton.textContent = 'Play';
+                } else {
+                    loopWavesurfer.play(loopRegion.start, loopRegion.end);
+                    isLoopPlaying = true;
+                    playButton.textContent = 'Pause';
+                }
+            });
+
+            let isLooping = false;
+            loopButton.addEventListener('click', function() {
+                isLooping = !isLooping;
+                this.textContent = isLooping ? 'Loop On' : 'Loop Off';
+            });
+
+            loopWavesurfer.on('audioprocess', function() {
+                if (isLooping && isLoopPlaying) {
+                    if (loopWavesurfer.getCurrentTime() >= loopRegion.end) {
+                        loopWavesurfer.pause();
+                        const loopDelay = parseFloat(delayInput.value) * 1000;
+                        clearTimeout(loopTimeoutId);
+                        loopTimeoutId = setTimeout(() => {
+                            loopWavesurfer.play(loopRegion.start);
+                        }, loopDelay);
+                    }
+                } else if (!isLooping && loopWavesurfer.getCurrentTime() >= loopRegion.end) {
+                    loopWavesurfer.pause();
+                    isLoopPlaying = false;
+                    playButton.textContent = 'Play';
+                }
+            });
+
+            savedLoops.push({
+                id: loopId,
+                wavesurfer: loopWavesurfer,
+                region: loopRegion
+            });
+
+            console.log('Loop saved:', {  // Debug line
+                id: loopId,
+                start: activeRegion.start,
+                end: activeRegion.end,
+                audioSrc: currentAudioSrc
+            });
+
+            // Save loop data to the server
+            fetch('/save_loop', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                id: loopId,
+                start: activeRegion.start,
+                end: activeRegion.end,
+                filename: currentFileName,
+                audioSrc: currentAudioSrc
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            console.log('Loop saved to server:', data);
+        })
+        .catch(error => {
+            console.error('Error saving loop to server:', error);
+        });
+
+        } catch (error) {
+            console.error('Error creating saved loop:', error);
+            savedLoopElement.remove(); // Remove the element if there was an error
+        }
+    } else {
+        console.log('No active region to save');  // Debug line
+    }
+});
+
+function loadSavedLoops(filename) {
+    fetch(`/load_loops/${filename}`)
+        .then(response => response.json())
+        .then(loops => {
+            const savedLoopsContainer = document.getElementById('saved-loops');
+            savedLoopsContainer.innerHTML = ''; // Clear existing loops
+            loops.forEach(loop => {
+                const loopId = loop.id;
+                const savedLoopElement = document.createElement('div');
+                savedLoopElement.className = 'saved-loop';
+                savedLoopElement.innerHTML = `
+                    <div id="savedLoop${loopId}" class="saved-loop-waveform"></div>
+                    <button class="saved-loop-play">Play</button>
+                    <button class="saved-loop-loop">Loop Off</button>
+                    <input type="number" class="saved-loop-delay" value="0" min="0" step="0.1">
+                    <label>Loop Delay (s)</label>
+                `;
+                savedLoopsContainer.appendChild(savedLoopElement);
+
+                const loopWavesurfer = WaveSurfer.create({
+                    container: `#savedLoop${loopId}`,
+                    waveColor: 'blue',
+                    progressColor: 'purple',
+                    responsive: true,
+                    barWidth: 2,
+                    barRadius: 3,
+                    cursorWidth: 1,
+                    height: 50,
+                    barGap: 2,
+                    plugins: [
+                        WaveSurfer.regions.create()
+                    ]
+                });
+
+                loopWavesurfer.load(loop.audioSrc);
+
+                const loopRegion = {
+                    start: loop.start,
+                    end: loop.end,
+                    color: 'rgba(0, 0, 255, 0.1)'
+                };
+
+                loopWavesurfer.on('ready', function() {
+                    loopWavesurfer.addRegion(loopRegion);
+                    loopWavesurfer.zoom(loopWavesurfer.drawer.width / (loopRegion.end - loopRegion.start));
+                    loopWavesurfer.seekTo(loopRegion.start / loopWavesurfer.getDuration());
+                });
+
+                const playButton = savedLoopElement.querySelector('.saved-loop-play');
+                const loopButton = savedLoopElement.querySelector('.saved-loop-loop');
+                const delayInput = savedLoopElement.querySelector('.saved-loop-delay');
+                            
+                let isLoopPlaying = false;
+                let isLooping = false;
+                let loopTimeoutId = null;
+                            
+                playButton.addEventListener('click', function() {
+                    if (isLoopPlaying) {
+                        loopWavesurfer.pause();
+                        isLoopPlaying = false;
+                        playButton.textContent = 'Play';
+                    } else {
+                        loopWavesurfer.play(loopRegion.start, loopRegion.end);
+                        isLoopPlaying = true;
+                        playButton.textContent = 'Pause';
+                    }
+                });
+                
+                loopButton.addEventListener('click', function() {
+                    isLooping = !isLooping;
+                    this.textContent = isLooping ? 'Loop On' : 'Loop Off';
+                    if (isLooping && !isLoopPlaying) {
+                        // Start playing if loop is turned on and it's not already playing
+                        loopWavesurfer.play(loopRegion.start, loopRegion.end);
+                        isLoopPlaying = true;
+                        playButton.textContent = 'Pause';
+                    }
+                });
+                
+                loopWavesurfer.on('audioprocess', function() {
+                    if (loopWavesurfer.getCurrentTime() >= loopRegion.end) {
+                        if (isLooping) {
+                            loopWavesurfer.pause();
+                            const loopDelay = parseFloat(delayInput.value) * 1000;
+                            clearTimeout(loopTimeoutId);
+                            loopTimeoutId = setTimeout(() => {
+                                loopWavesurfer.play(loopRegion.start);
+                            }, loopDelay);
+                        } else {
+                            loopWavesurfer.pause();
+                            isLoopPlaying = false;
+                            playButton.textContent = 'Play';
+                        }
+                    }
+                });
+                
+                loopWavesurfer.on('pause', function() {
+                    isLoopPlaying = false;
+                    playButton.textContent = 'Play';
+                });
+                
+                loopWavesurfer.on('finish', function() {
+                    isLoopPlaying = false;
+                    playButton.textContent = 'Play';
+                });
+
+                // Update loop region when the main waveform's zoom changes
+                document.getElementById('zoom').addEventListener('input', function() {
+                    const zoomLevel = parseInt(this.value);
+                    loopWavesurfer.zoom(zoomLevel);
+                });
+
+                // Clean up resources when the loop is removed
+                function cleanupLoop() {
+                    clearTimeout(loopTimeoutId);
+                    loopWavesurfer.destroy();
+                }
+
+                savedLoops.push({
+                    id: loopId,
+                    wavesurfer: loopWavesurfer,
+                    region: loopRegion
+                });
+            });
+        })
+        .catch(error => console.error('Error loading saved loops:', error));
+}
+
+        // Volume control (unchanged)
+        document.getElementById('volume').addEventListener('input', function(e) {
+            if (wavesurfer) {
+                wavesurfer.setVolume(e.target.value);
+            }
+        });
+
+        // Zoom control (unchanged)
+        document.getElementById('zoom').addEventListener('input', debounce(function(e) {
+            applyZoom(Number(e.target.value));
+        }, 50));
+
+        function applyZoom(zoomLevel) {
+            if (wavesurfer) {
+                requestAnimationFrame(() => {
+                    wavesurfer.zoom(zoomLevel);
+                    currentZoomLevel = zoomLevel;
+                    console.log('Current zoom level:', currentZoomLevel);
+                });
+            }
+        }
+
+        // Loop button
+        document.getElementById('loop').addEventListener('click', function() {
+            isLooping = !isLooping;
+            this.textContent = isLooping ? 'Loop On' : 'Loop Off';
+            if (!isLooping) {
+                clearTimeout(loopTimeoutId);
+            }
+        });
+    </script>
+</body>
+</html>
